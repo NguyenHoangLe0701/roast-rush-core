@@ -171,7 +171,7 @@ jobs:
 
       - name: Run Trivy Vulnerability Scanner on Frontend Image
         if: hashFiles('frontend/Dockerfile') != ''
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'roastrush-web:${{ github.sha }}'
           format: 'table'
@@ -194,7 +194,7 @@ jobs:
 
       - name: Run Trivy Vulnerability Scanner on Backend Image
         if: hashFiles('service/Dockerfile') != ''
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'roastrush-core:${{ github.sha }}'
           format: 'table'
