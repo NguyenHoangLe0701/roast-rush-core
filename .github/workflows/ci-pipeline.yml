@@ -1,0 +1,179 @@
+name: RoastRush Core CI & Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================================
+  # STAGE 1: SECRET SCAN (Gitleaks)
+  # ==========================================================================
+  secret-scan:
+    name: "Stage 1: Secret Scan (Gitleaks)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks Secret Scanner
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # STAGE 2: BACKEND BUILD & UNIT TEST (Spring Boot 3 / Java 17 - service/)
+  # ==========================================================================
+  backend-build-test:
+    name: "Stage 2: Backend Build & Unit Test (Java 17)"
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Check if Backend pom.xml exists in service/
+        id: check_backend
+        run: |
+          if [ -f "service/pom.xml" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Notice: service/pom.xml not yet initialized, skipping Maven execution."
+          fi
+
+      - name: Set up JDK 17 (Temurin)
+        if: steps.check_backend.outputs.exists == 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build & Run Unit Tests with H2 In-Memory DB
+        if: steps.check_backend.outputs.exists == 'true'
+        working-directory: ./service
+        env:
+          SPRING_PROFILES_ACTIVE: test
+          SPRING_DATASOURCE_URL: jdbc:h2:mem:roast_rush_test_db;MODE=MySQL;DB_CLOSE_DELAY=-1
+          SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.h2.Driver
+          SPRING_DATASOURCE_USERNAME: sa
+          SPRING_DATASOURCE_PASSWORD: ""
+          SPRING_JPA_DATABASE_PLATFORM: org.hibernate.dialect.H2Dialect
+          SPRING_FLYWAY_ENABLED: "false"
+          JASYPT_ENCRYPTOR_PASSWORD: ci_test_master_secret_key
+        run: mvn -B clean verify
+
+  # ==========================================================================
+  # STAGE 3: FRONTEND LINT & BUILD (React 18 + Vite + TypeScript - frontend/)
+  # ==========================================================================
+  frontend-lint-build:
+    name: "Stage 3: Frontend Lint & Build (Node 20)"
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20 with npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Dependencies (Clean Install)
+        run: npm ci
+
+      - name: Run Syntax & Type Check (ESLint / TypeScript Check)
+        run: |
+          if npx --no-install eslint --version >/dev/null 2>&1; then
+            npx eslint src --ext .ts,.tsx
+          else
+            npm run lint
+          fi
+
+      - name: Build Production Frontend Bundle
+        run: npm run build
+
+  # ==========================================================================
+  # STAGE 4: DOCKER BUILD & TRIVY SECURITY SCAN (Main / Master Push Only)
+  # ==========================================================================
+  docker-build-and-scan:
+    name: "Stage 4: Docker Build & Trivy Scan"
+    runs-on: ubuntu-latest
+    needs:
+      - backend-build-test
+      - frontend-lint-build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Frontend Docker Image (roastrush-web)
+        if: hashFiles('frontend/Dockerfile') != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          load: true
+          tags: roastrush-web:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Vulnerability Scanner on Frontend Image
+        if: hashFiles('frontend/Dockerfile') != ''
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: 'roastrush-web:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'HIGH,CRITICAL'
+
+      - name: Build Backend Docker Image (roastrush-core)
+        if: hashFiles('service/Dockerfile') != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: ./service
+          file: ./service/Dockerfile
+          push: false
+          load: true
+          tags: roastrush-core:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Vulnerability Scanner on Backend Image
+        if: hashFiles('service/Dockerfile') != ''
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: 'roastrush-core:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'HIGH,CRITICAL'
+
