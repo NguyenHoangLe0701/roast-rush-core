@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist false-positive UUID idempotency keys in frontend demo state"
+commits = [
+  "e73ea4159edc09e1e4eb82af6740d94acbd3a361",
+]
+regexes = [
+  "idempotencyKey:\\s*'[0-9a-f-]+'",
+]
